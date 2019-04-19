@@ -5,9 +5,15 @@
 #include <map>
 #include <string>
 #include <tuple>
-#include <array>
 
 static constexpr uint8_t maxBytesPerParameter = 64;
+
+struct IpmiSysInfo
+{
+    uint8_t encoding;
+    uint8_t stringLen;
+    uint8_t stringDataN[maxBytesPerParameter];
+};
 
 /**
  * Key-value store for string-type system info parameters.
@@ -27,7 +33,7 @@ class SysInfoParamStoreIntf
      * @return tuple of bool and string, true if parameter is found and
      * string set accordingly.
      */
-    virtual std::tuple<bool, std::string>
+    virtual std::tuple<bool, IpmiSysInfo>
         lookup(uint8_t paramSelector) const = 0;
 
     /**
@@ -37,7 +43,8 @@ class SysInfoParamStoreIntf
      * @param[in] s - the value to set.
      * @param[in] isNonVolatile - if data should be persistent.
      */
-    virtual void update(uint8_t paramSelector, const std::array<uint8_t, maxBytesPerParameter>& s,
+    virtual void update(uint8_t paramSelector,
+                        const IpmiSysInfo& s,
                         bool isNonVolatile) = 0;
 
     /**
@@ -48,8 +55,10 @@ class SysInfoParamStoreIntf
      * @param[in] paramSelector - the key to update.
      * @param[in] callback - the callback to use for parameter retrieval.
      */
-    virtual void update(uint8_t paramSelector,
-                        const std::function<std::array<uint8_t, maxBytesPerParameter>()>& callback) = 0;
+    virtual void
+        update(uint8_t paramSelector,
+               const std::function<IpmiSysInfo()>&
+                   callback) = 0;
 
     // TODO: Store "read-only" flag for each parameter.
     // TODO: Function to erase a parameter?
@@ -61,13 +70,19 @@ class SysInfoParamStoreIntf
 class SysInfoParamStore : public SysInfoParamStoreIntf
 {
   public:
-    std::tuple<bool, std::string> lookup(uint8_t paramSelector) const override;
-    void update(uint8_t paramSelector, const std::array<uint8_t, maxBytesPerParameter>& s,
-                bool isNonVolatile) override;
+    std::tuple<bool, IpmiSysInfo>
+        lookup(uint8_t paramSelector) const override;
     void update(uint8_t paramSelector,
-                const std::function<std::array<uint8_t, maxBytesPerParameter>()>& callback) override;
+                const IpmiSysInfo& s,
+                bool isNonVolatile) override;
+    void
+        update(uint8_t paramSelector,
+               const std::function<IpmiSysInfo()>&
+                   callback) override;
     int restore(uint8_t paramSelector);
 
   private:
-    std::map<uint8_t, std::function<std::array<uint8_t, maxBytesPerParameter>()>> params;
+    std::map<uint8_t,
+             std::function<IpmiSysInfo()>>
+        params;
 };

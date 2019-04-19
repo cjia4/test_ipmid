@@ -3,13 +3,14 @@
 #include <fstream>
 #include <phosphor-logging/log.hpp>
 
-std::tuple<bool, std::string>
+std::tuple<bool, IpmiSysInfo>
     SysInfoParamStore::lookup(uint8_t paramSelector) const
 {
     const auto iterator = params.find(paramSelector);
+    IpmiSysInfo dummy = {0};
     if (iterator == params.end())
     {
-        return std::make_tuple(false, "");
+        return std::make_tuple(false, dummy);
     }
 
     auto& callback = iterator->second;
@@ -17,9 +18,9 @@ std::tuple<bool, std::string>
     return std::make_tuple(true, s);
 }
 
-void SysInfoParamStore::update(uint8_t paramSelector,
-                               const std::array<uint8_t, maxBytesPerParameter>& s,
-                               bool isNonVolatile)
+void SysInfoParamStore::update(
+    uint8_t paramSelector, const IpmiSysInfo& s,
+    bool isNonVolatile)
 {
     // Add a callback that captures a copy of the string passed and returns it
     // when invoked.
@@ -28,9 +29,11 @@ void SysInfoParamStore::update(uint8_t paramSelector,
         try
         {
             std::string filename = "/var/lib/ipmi/sysinfo" +
-                                   std::to_string(paramSelector) + ".txt";
-            std::ofstream outFile(filename, std::ios::out | std::ios::trunc);
-            outFile.write(s.c_str(), s.size());
+                                   std::to_string(paramSelector) + ".dat";
+            std::ofstream outFile(filename, std::ios::out | std::ios::binary |
+                                                std::ios::trunc);
+            char * buf =  const_cast<char *>(reinterpret_cast<const char *>(&s));
+            outFile.write(buf, sizeof(IpmiSysInfo));
             outFile.close();
         }
         catch (std::ios_base::failure& e)
@@ -48,23 +51,22 @@ void SysInfoParamStore::update(uint8_t paramSelector,
     // clang-format on
 }
 
-void SysInfoParamStore::update(uint8_t paramSelector,
-                               const std::function<std::array<uint8_t, maxBytesPerParameter>()>& callback)
+void SysInfoParamStore::update(
+    uint8_t paramSelector,
+    const std::function<IpmiSysInfo()>& callback)
 {
     params[paramSelector] = callback;
 }
 
 int SysInfoParamStore::restore(uint8_t paramSelector)
 {
-    constexpr size_t buffLen = 64;
-    char buf[buffLen];
     std::string filename =
-        "/var/lib/ipmi/sysinfo" + std::to_string(paramSelector) + ".txt";
-    std::string s = "";
+        "/var/lib/ipmi/sysinfo" + std::to_string(paramSelector) + ".dat";
+    IpmiSysInfo s;
 
     try
     {
-        std::ifstream infile(filename);
+        std::ifstream infile(filename, std::ios::in | std::ios::binary);
         if (!infile.good())
         {
             phosphor::logging::log<phosphor::logging::level::ERR>(
@@ -74,16 +76,7 @@ int SysInfoParamStore::restore(uint8_t paramSelector)
         }
         if (infile.peek() != std::ifstream::traits_type::eof())
         { // not empty file
-            infile.read(buf, buffLen);
-            uint8_t size = infile.gcount();
-            if (size > buffLen)
-            {
-                phosphor::logging::log<phosphor::logging::level::ERR>(
-                    "data from file excced maximum size");
-                return -1;
-            }
-            buf[size] = '\0';
-            s = buf;
+            infile.read( reinterpret_cast<char *>(&s), sizeof(IpmiSysInfo));
         }
         infile.close();
     }

@@ -1,7 +1,6 @@
 #pragma once
 
-#include "types.hpp"
-
+#include <ipmid/types.hpp>
 #include <string>
 // IPMI commands for Transport net functions.
 enum ipmi_netfn_storage_cmds
@@ -9,6 +8,8 @@ enum ipmi_netfn_storage_cmds
     // Get capability bits
     IPMI_CMD_SET_LAN = 0x01,
     IPMI_CMD_GET_LAN = 0x02,
+    IPMI_CMD_SET_SOL_CONF_PARAMS = 0x21,
+    IPMI_CMD_GET_SOL_CONF_PARAMS = 0x22,
 };
 
 // Command specific completion codes
@@ -80,6 +81,28 @@ enum class LanParam : uint8_t
     IPV6_NEIGHBOR_TIMING_CONFIGURATION = 80,
 };
 
+// Data length of parameters
+constexpr size_t LAN_PARAM_INPROGRESS_SIZE = 3;
+constexpr size_t LAN_PARAM_IP_SIZE = 6;
+constexpr size_t LAN_PARAM_IPSRC_SIZE = 3;
+constexpr size_t LAN_PARAM_MAC_SIZE = 8;
+constexpr size_t LAN_PARAM_SUBNET_SIZE = 6;
+constexpr size_t LAN_PARAM_GATEWAY_SIZE = 6;
+constexpr size_t LAN_PARAM_VLAN_SIZE = 4;
+constexpr size_t LAN_PARAM_IPV6_AND_IPV4_ENABLES_SIZE = 3;
+constexpr size_t LAN_PARAM_IPV6_STATIC_ADDRESSES_SIZE = 23;
+constexpr size_t LAN_PARAM_IPV6_ROUTER_ADDRESS_CONF_CTRL_SIZE = 3;
+constexpr size_t LAN_PARAM_IPV6_STATIC_ROUTER_1_IP_ADDR_SIZE = 18;
+constexpr size_t LAN_PARAM_IPV6_STATIC_ROUTER_1_PREFIX_LEN_SIZE = 3;
+constexpr size_t LAN_PARAM_IPV6_STATIC_ROUTER_1_PREFIX_VAL_SIZE = 19;
+constexpr size_t LAN_PARAM_IPV6_STATIC_ROUTER_2_IP_ADDR_SIZE = 18;
+constexpr size_t LAN_PARAM_IPV6_STATIC_ROUTER_2_PREFIX_LEN_SIZE = 3;
+constexpr size_t LAN_PARAM_IPV6_STATIC_ROUTER_2_PREFIX_VAL_SIZE = 19;
+
+constexpr uint8_t DUID_LEN = 10;
+constexpr uint8_t DUID_LL_TYPE = 3;
+constexpr uint8_t DUIC_ETH_HW_TYPE = 1;
+
 constexpr uint8_t SET_COMPLETE = 0;
 constexpr uint8_t SET_IN_PROGRESS = 1;
 constexpr uint8_t SET_COMMIT_WRITE = 2;         // Optional
@@ -102,6 +125,20 @@ struct ChannelConfig_t
     uint8_t lan_set_in_progress = SET_COMPLETE;
     bool flush = false;
 
+    // IPV6 parameters
+    uint8_t ipv6AddressSource = 0x0;
+    uint8_t ipv6AddressingEnables = 0x2;
+    std::string ipv6Addr;
+    uint8_t ipv6Prefix = 32;
+    uint8_t ipv6AddressStatus = 0x0;
+    uint8_t ipv6RouterAddressConfigControl = 0x0;
+    std::string ipv6GatewayAddr;
+    std::string ipv6BackupGatewayAddr;
+    uint8_t ipv6GatewayPrefixLength;
+    std::string ipv6GatewayPrefixValue;
+    uint8_t ipv6BackupGatewayPrefixLength = 0x0;
+    std::string ipv6BackupGatewayPrefixValue;
+
     void clear()
     {
         ipaddr.clear();
@@ -112,6 +149,20 @@ struct ChannelConfig_t
         ipsrc = ipmi::network::IPOrigin::UNSPECIFIED;
         lan_set_in_progress = SET_COMPLETE;
         flush = false;
+
+        // IPv6
+        ipv6Addr.clear();
+        ipv6GatewayAddr.clear();
+        ipv6BackupGatewayAddr.clear();
+        ipv6AddressingEnables = 0x2;
+        ipv6AddressSource = 0x0;
+        ipv6Prefix = 32;
+        ipv6AddressStatus = 0x0;
+        ipv6RouterAddressConfigControl = 0x0;
+        ipv6GatewayPrefixLength = 0x0;
+        ipv6GatewayPrefixValue.clear();
+        ipv6BackupGatewayPrefixLength = 0x0;
+        ipv6BackupGatewayPrefixValue.clear();
     }
 };
 
@@ -137,3 +188,120 @@ void commitNetworkChanges();
  * @param[in] channel: channel number.
  */
 void applyChanges(int channel);
+
+namespace sol
+{
+enum class Parameter
+{
+    progress,       //!< Set In Progress.
+    enable,         //!< SOL Enable.
+    authentication, //!< SOL Authentication.
+    accumulate,     //!< Character Accumulate Interval & Send Threshold.
+    retry,          //!< SOL Retry.
+    nvbitrate,      //!< SOL non-volatile bit rate.
+    vbitrate,       //!< SOL volatile bit rate.
+    channel,        //!< SOL payload channel.
+    port,           //!< SOL payload port.
+};
+
+enum class Privilege : uint8_t
+{
+    highestPriv,
+    callbackPriv,
+    userPriv,
+    operatorPriv,
+    adminPriv,
+    oemPriv,
+};
+
+} // namespace sol
+
+constexpr uint8_t progressMask = 0x03;
+constexpr uint8_t enableMask = 0x01;
+
+struct Auth
+{
+#if BYTE_ORDER == LITTLE_ENDIAN
+    uint8_t privilege : 4; //!< SOL privilege level.
+    uint8_t reserved : 2;  //!< Reserved.
+    uint8_t auth : 1;      //!< Force SOL payload Authentication.
+    uint8_t encrypt : 1;   //!< Force SOL payload encryption.
+#endif
+
+#if BYTE_ORDER == BIG_ENDIAN
+    uint8_t encrypt : 1;   //!< Force SOL payload encryption.
+    uint8_t auth : 1;      //!< Force SOL payload Authentication.
+    uint8_t reserved : 2;  //!< Reserved.
+    uint8_t privilege : 4; //!< SOL privilege level.
+#endif
+} __attribute__((packed));
+
+struct Accumulate
+{
+    uint8_t interval;  //!< Character accumulate interval.
+    uint8_t threshold; //!< Character send threshold.
+} __attribute__((packed));
+
+struct Retry
+{
+#if BYTE_ORDER == LITTLE_ENDIAN
+    uint8_t count : 3;    //!< SOL retry count.
+    uint8_t reserved : 5; //!< Reserved.
+#endif
+
+#if BYTE_ORDER == BIG_ENDIAN
+    uint8_t reserved : 5; //!< Reserved.
+    uint8_t count : 3;    //!< SOL retry count.
+#endif
+
+    uint8_t interval; //!< SOL retry interval.
+} __attribute__((packed));
+
+struct SetSOLConfParamsRequest
+{
+#if BYTE_ORDER == LITTLE_ENDIAN
+    uint8_t channelNumber : 4; //!< Channel number.
+    uint8_t reserved : 4;      //!< Reserved.
+#endif
+
+#if BYTE_ORDER == BIG_ENDIAN
+    uint8_t reserved : 4;      //!< Reserved.
+    uint8_t channelNumber : 4; //!< Channel number.
+#endif
+
+    uint8_t paramSelector; //!< Parameter selector.
+    union
+    {
+        uint8_t value;         //!< Represents one byte SOL parameters.
+        struct Accumulate acc; //!< Character accumulate values.
+        struct Retry retry;    //!< Retry values.
+        struct Auth auth;      //!< Authentication parameters.
+    };
+} __attribute__((packed));
+
+struct SetSOLConfParamsResponse
+{
+    uint8_t completionCode; //!< Completion code.
+} __attribute__((packed));
+
+struct GetSOLConfParamsRequest
+{
+#if BYTE_ORDER == LITTLE_ENDIAN
+    uint8_t channelNum : 4;  //!< Channel number.
+    uint8_t reserved : 3;    //!< Reserved.
+    uint8_t getParamRev : 1; //!< Get parameter or Get parameter revision
+#endif
+
+#if BYTE_ORDER == BIG_ENDIAN
+    uint8_t getParamRev : 1; //!< Get parameter or Get parameter revision
+    uint8_t reserved : 3;    //!< Reserved.
+    uint8_t channelNum : 4;  //!< Channel number.
+#endif
+
+    uint8_t paramSelector; //!< Parameter selector.
+    uint8_t setSelector;   //!< Set selector.
+    uint8_t blockSelector; //!< Block selector.
+} __attribute__((packed));
+
+static constexpr uint16_t ipmiStdPort = 623;
+static constexpr uint8_t solParameterRevision = 0x11;

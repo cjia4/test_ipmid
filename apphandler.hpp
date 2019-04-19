@@ -2,6 +2,10 @@
 
 #include <stdint.h>
 
+constexpr int maxChunk = 255;
+constexpr int smallChunkSize = 14;
+constexpr int chunkSize = 16;
+
 // IPMI commands for App net functions.
 enum ipmi_netfn_app_cmds
 {
@@ -19,6 +23,7 @@ enum ipmi_netfn_app_cmds
     IPMI_CMD_SET_CHAN_ACCESS = 0x40,
     IPMI_CMD_GET_CHANNEL_ACCESS = 0x41,
     IPMI_CMD_GET_CHAN_INFO = 0x42,
+    IPMI_CMD_MASTER_WRITE_READ = 0x52,
     IPMI_CMD_GET_CHAN_CIPHER_SUITES = 0x54,
     IPMI_CMD_SET_SYSTEM_INFO = 0x58,
     IPMI_CMD_GET_SYSTEM_INFO = 0x59,

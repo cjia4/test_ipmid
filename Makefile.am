@@ -6,16 +6,13 @@ export AM_CPPFLAGS
 providersdir = ${libdir}/ipmid-providers
 providers_LTLIBRARIES =
 
-sbin_PROGRAMS = \
+bin_PROGRAMS = \
 	ipmid
 
 ipmid_SOURCES = \
-	ipmid.cpp \
+	ipmid-new.cpp \
 	settings.cpp \
-	host-cmd-manager.cpp \
-	utils.cpp \
-	oemrouter.cpp
-nodist_ipmid_SOURCES = ipmiwhitelist.cpp
+	host-cmd-manager.cpp
 
 libipmi20_BUILT_LIST = \
 	sensor-gen.cpp \
@@ -39,11 +36,14 @@ COMMON_CXX = \
 	$(PHOSPHOR_DBUS_INTERFACES_CFLAGS) \
 	-DBOOST_ERROR_CODE_HEADER_ONLY \
 	-DBOOST_SYSTEM_NO_DEPRECATED \
+	-DBOOST_COROUTINES_NO_DEPRECATION_WARNING \
+	-DBOOST_ASIO_DISABLE_THREADS \
 	-DBOOST_ALL_NO_LIB
 
 ipmid_CXXFLAGS = $(COMMON_CXX)
 ipmid_LDADD = \
 	libipmid/libipmid.la \
+	user_channel/libchannellayer.la \
 	libipmid-host/libipmid-host.la
 ipmid_LDFLAGS = \
 	$(SYSTEMD_LIBS) \
@@ -52,8 +52,8 @@ ipmid_LDFLAGS = \
 	$(PHOSPHOR_LOGGING_LIBS) \
 	$(PHOSPHOR_DBUS_INTERFACES_LIBS) \
 	$(CRYPTO_LIBS) \
+	-lboost_coroutine \
 	-lstdc++fs \
-	-pthread \
 	-export-dynamic
 
 # TODO: Rather than use -export-dynamic, we should use -export-symbol to have a
@@ -90,7 +90,6 @@ libipmi20_la_SOURCES = \
 	transporthandler.cpp \
 	globalhandler.cpp \
 	groupext.cpp \
-	utils.cpp \
 	selutility.cpp \
 	ipmi_fru_info_area.cpp \
 	read_fru_data.cpp \
@@ -114,18 +113,20 @@ libipmi20_la_LDFLAGS = \
 	$(PHOSPHOR_LOGGING_LIBS) \
 	$(PHOSPHOR_DBUS_INTERFACES_LIBS) \
 	-lstdc++fs \
+	-lboost_coroutine \
 	-version-info 0:0:0 -shared
 libipmi20_la_CXXFLAGS = $(COMMON_CXX)
 
 providers_LTLIBRARIES += libusercmds.la
 libusercmds_la_LIBADD = \
 	libipmid/libipmid.la \
-	user_channel/libuserlayer.la
+	user_channel/libuserlayer.la \
+	user_channel/libchannellayer.la
 libusercmds_la_SOURCES = \
 	user_channel/usercommands.cpp
 libusercmds_la_LDFLAGS = \
 	$(PHOSPHOR_LOGGING_LIBS) \
-	$(LIBS) \
+	$(libmapper_LIBS) \
 	-version-info 0:0:0 -shared
 libusercmds_la_CXXFLAGS = $(COMMON_CXX)
 
@@ -144,6 +145,19 @@ libsysintfcmds_la_LDFLAGS = \
 	$(SDBUSPLUS_LIBS) \
 	-version-info 0:0:0 -shared
 libsysintfcmds_la_CXXFLAGS = $(COMMON_CXX)
+
+libwhitelistdir = ${libdir}/ipmid-providers
+libwhitelist_LTLIBRARIES = libwhitelist.la
+libwhitelist_la_SOURCES = \
+	whitelist-filter.cpp
+libwhitelist_la_LDFLAGS = \
+	$(SYSTEMD_LIBS) \
+	$(libmapper_LIBS) \
+	$(PHOSPHOR_LOGGING_LIBS) \
+	$(PHOSPHOR_DBUS_INTERFACES_LIBS) \
+	-version-info 0:0:0 -shared
+libwhitelist_la_CXXFLAGS = $(COMMON_CXX)
+nodist_libwhitelist_la_SOURCES = ipmiwhitelist.cpp
 
 nobase_include_HEADERS = \
 	user_channel/channel_layer.hpp \

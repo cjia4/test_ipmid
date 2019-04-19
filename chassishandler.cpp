@@ -2,14 +2,10 @@
 
 #include "chassishandler.hpp"
 
-#include "ipmid.hpp"
 #include "settings.hpp"
-#include "types.hpp"
-#include "utils.hpp"
 
 #include <arpa/inet.h>
 #include <endian.h>
-#include <ipmid/api.h>
 #include <limits.h>
 #include <mapper.h>
 #include <netinet/in.h>
@@ -17,8 +13,12 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <future>
+#include <ipmid/api.hpp>
+#include <ipmid/types.hpp>
+#include <ipmid/utils.hpp>
 #include <map>
 #include <phosphor-logging/elog-errors.hpp>
 #include <phosphor-logging/log.hpp>
@@ -34,19 +34,6 @@
 #include <xyz/openbmc_project/Control/Power/RestorePolicy/server.hpp>
 #include <xyz/openbmc_project/State/Host/server.hpp>
 #include <xyz/openbmc_project/State/PowerOnHours/server.hpp>
-
-#if __has_include(<filesystem>)
-#include <filesystem>
-#elif __has_include(<experimental/filesystem>)
-#include <experimental/filesystem>
-namespace std
-{
-// splice experimental::filesystem into std
-namespace filesystem = std::experimental::filesystem;
-} // namespace std
-#else
-#error filesystem not available
-#endif
 
 // Defines
 #define SET_PARM_VERSION 0x01
@@ -103,6 +90,11 @@ static constexpr auto chassisPOHStateIntf =
     "xyz.openbmc_project.State.PowerOnHours";
 static constexpr auto pOHCounterProperty = "POHCounter";
 static constexpr auto match = "chassis0";
+const static constexpr char* stateHostInterface =
+    "xyz.openbmc_project.State.Host";
+const static constexpr char* hostRestartCauseInterface =
+    "xyz.openbmc_project.State.Host";
+const static constexpr char* hostRestartCause = "HostRestartCause";
 const static constexpr char chassisCapIntf[] =
     "xyz.openbmc_project.Control.ChassisCapabilities";
 const static constexpr char chassisCapFlagsProp[] = "CapabilitiesFlags";
@@ -113,6 +105,8 @@ const static constexpr char chassisSMDevAddrProp[] = "SMDeviceAddress";
 const static constexpr char chassisBridgeDevAddrProp[] = "BridgeDeviceAddress";
 static constexpr uint8_t chassisCapFlagMask = 0x0f;
 static constexpr uint8_t chassisCapAddrMask = 0xfe;
+static constexpr uint8_t disableResetButton = 0x2;
+static constexpr uint8_t disablePowerButton = 0x1;
 
 typedef struct
 {
@@ -140,6 +134,19 @@ struct GetPOHCountResponse
     uint8_t minPerCount;       ///< Minutes per count
     uint8_t counterReading[4]; ///< Counter reading
 } __attribute__((packed));
+
+typedef struct
+{
+    uint8_t disables; // Front Panel Button Enables
+    //[7:4] - reserved
+    //[3] - 1b = disable Standby (sleep) button for entering standby (sleep)
+    //(control can still be used to wake the system)
+    //[2] - 1b = disable Diagnostic Interrupt button
+    //[1] - 1b = disable Reset button
+    //[0] - 1b = disable Power off button for power off only (in the case there
+    // is a single combined power/standby (sleep) button, then this also
+    // disables sleep requests via that button)
+} __attribute__((packed)) IPMISetFrontPanelButtonEnablesReq;
 
 // Phosphor Host State manager
 namespace State = sdbusplus::xyz::openbmc_project::State::server;
@@ -197,6 +204,13 @@ struct set_sys_boot_options_t
 {
     uint8_t parameter;
     uint8_t data[SIZE_BOOT_OPTION];
+} __attribute__((packed));
+
+struct GetSysRestartCauseResponse
+{
+    uint8_t restartCause;
+    uint8_t channelNum;
+
 } __attribute__((packed));
 
 int getHostNetworkData(get_sys_boot_options_response_t* respptr)
@@ -810,13 +824,14 @@ ipmi_ret_t ipmi_get_chassis_status(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
                                    ipmi_data_len_t data_len,
                                    ipmi_context_t context)
 {
-    const char* objname = "/org/openbmc/control/power0";
-    const char* intf = "org.openbmc.control.Power";
+    const char* objname = "/xyz/openbmc_project/Chassis/Control/Power0";
+    const char* intf = "xyz.openbmc_project.Chassis.Control.Power";
 
     sd_bus* bus = NULL;
     sd_bus_message* reply = NULL;
     int r = 0;
     int pgood = 0;
+    bool pFail = true;
     char* busname = NULL;
     ipmi_ret_t rc = IPMI_CC_OK;
     ipmi_get_chassis_status_t chassis_status{};
@@ -877,6 +892,26 @@ ipmi_ret_t ipmi_get_chassis_status(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
         goto finish;
     }
 
+    r = sd_bus_get_property(bus, busname, objname, intf, "PFail", NULL, &reply,
+                            "b");
+    if (r < 0)
+    {
+        log<level::ERR>("Failed to call sd_bus_get_property",
+                        entry("PROPERTY=%s", "PFail"), entry("ERRNO=0x%X", -r),
+                        entry("BUS=%s", busname), entry("PATH=%s", objname),
+                        entry("INTERFACE=%s", intf));
+        rc = IPMI_CC_UNSPECIFIED_ERROR;
+        goto finish;
+    }
+
+    r = sd_bus_message_read(reply, "b", &pFail);
+    if (r < 0)
+    {
+        log<level::ERR>("Failed to read PFail:", entry("ERRNO=0x%X", -r));
+        rc = IPMI_CC_UNSPECIFIED_ERROR;
+        goto finish;
+    }
+
     s = dbusToIpmi.at(powerRestore);
 
     // Current Power State
@@ -925,6 +960,11 @@ ipmi_ret_t ipmi_get_chassis_status(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
 
     chassis_status.last_power_event = 0;
 
+    if (pFail)
+    {
+        chassis_status.last_power_event |= 1;
+    }
+
     // Misc. Chassis State
     // [7] – reserved
     // [6] – 1b = Chassis Identify command and state info supported (Optional)
@@ -949,6 +989,8 @@ ipmi_ret_t ipmi_get_chassis_status(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
 
     //  Front Panel Button Capabilities and disable/enable status(Optional)
     //  set to 0,  for we don't support them.
+    // TODO, it is tracked by an issue:
+    // https://github.com/openbmc/phosphor-host-ipmid/issues/122
     chassis_status.front_panel_button_cap_status = 0;
 
     // Pack the actual response
@@ -1165,6 +1207,9 @@ void enclosureIdentifyLed(bool flag)
 {
     using namespace chassis::internal;
     std::string connection = std::move(getEnclosureIdentifyConnection());
+    auto msg = std::string("enclosureIdentifyLed(") +
+               boost::lexical_cast<std::string>(flag) + ")";
+    log<level::DEBUG>(msg.c_str());
     auto led =
         dbus.new_method_call(connection.c_str(), identify_led_object_name,
                              "org.freedesktop.DBus.Properties", "Set");
@@ -1204,29 +1249,16 @@ void createIdentifyTimer()
     }
 }
 
-ipmi_ret_t ipmi_chassis_identify(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
-                                 ipmi_request_t request,
-                                 ipmi_response_t response,
-                                 ipmi_data_len_t data_len,
-                                 ipmi_context_t context)
+ipmi::RspType<> ipmiChassisIdentify(std::optional<uint8_t> interval,
+                                    std::optional<uint8_t> force)
 {
-    if (*data_len > chassisIdentifyReqLength)
-    {
-        return IPMI_CC_REQ_DATA_LEN_INVALID;
-    }
-    uint8_t identifyInterval =
-        *data_len > identifyIntervalPos
-            ? (static_cast<uint8_t*>(request))[identifyIntervalPos]
-            : DEFAULT_IDENTIFY_TIME_OUT;
-    bool forceIdentify =
-        (*data_len == chassisIdentifyReqLength)
-            ? (static_cast<uint8_t*>(request))[forceIdentifyPos] & 0x01
-            : false;
+    uint8_t identifyInterval = interval.value_or(DEFAULT_IDENTIFY_TIME_OUT);
+    bool forceIdentify = force.value_or(0) & 0x01;
 
     if (identifyInterval || forceIdentify)
     {
-        // stop the timer if already started, for force identify we should
-        // not turn off LED
+        // stop the timer if already started;
+        // for force identify we should not turn off LED
         identifyTimer->stop();
         try
         {
@@ -1235,12 +1267,12 @@ ipmi_ret_t ipmi_chassis_identify(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
         catch (const InternalFailure& e)
         {
             report<InternalFailure>();
-            return IPMI_CC_RESPONSE_ERROR;
+            return ipmi::responseResponseError();
         }
 
         if (forceIdentify)
         {
-            return IPMI_CC_OK;
+            return ipmi::responseSuccess();
         }
         // start the timer
         auto time = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1252,7 +1284,7 @@ ipmi_ret_t ipmi_chassis_identify(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
         identifyTimer->stop();
         enclosureIdentifyLedOff();
     }
-    return IPMI_CC_OK;
+    return ipmi::responseSuccess();
 }
 
 namespace boot_options
@@ -1265,7 +1297,8 @@ constexpr auto ipmiDefault = 0;
 std::map<IpmiValue, Source::Sources> sourceIpmiToDbus = {
     {0x01, Source::Sources::Network},
     {0x02, Source::Sources::Disk},
-    {0x05, Source::Sources::ExternalMedia},
+    {0x05, Source::Sources::DVD},
+    {0x0f, Source::Sources::Removable},
     {ipmiDefault, Source::Sources::Default}};
 
 std::map<IpmiValue, Mode::Modes> modeIpmiToDbus = {
@@ -1276,7 +1309,8 @@ std::map<IpmiValue, Mode::Modes> modeIpmiToDbus = {
 std::map<Source::Sources, IpmiValue> sourceDbusToIpmi = {
     {Source::Sources::Network, 0x01},
     {Source::Sources::Disk, 0x02},
-    {Source::Sources::ExternalMedia, 0x05},
+    {Source::Sources::DVD, 0x05},
+    {Source::Sources::Removable, 0x0f},
     {Source::Sources::Default, ipmiDefault}};
 
 std::map<Mode::Modes, IpmiValue> modeDbusToIpmi = {
@@ -1337,6 +1371,10 @@ static ipmi_ret_t setBootMode(const Mode::Modes& mode)
     return IPMI_CC_OK;
 }
 
+static constexpr uint8_t setComplete = 0x0;
+static constexpr uint8_t setInProgress = 0x1;
+static uint8_t transferStatus = setComplete;
+
 ipmi_ret_t ipmi_chassis_get_sys_boot_options(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
                                              ipmi_request_t request,
                                              ipmi_response_t response,
@@ -1351,11 +1389,21 @@ ipmi_ret_t ipmi_chassis_get_sys_boot_options(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
     get_sys_boot_options_t* reqptr = (get_sys_boot_options_t*)request;
     IpmiValue bootOption = ipmiDefault;
 
+    if (reqptr->parameter ==
+        static_cast<uint8_t>(BootOptionParameter::SET_IN_PROGRESS))
+    {
+        *data_len =
+            static_cast<uint8_t>(BootOptionResponseSize::SET_IN_PROGRESS);
+        resp->version = SET_PARM_VERSION;
+        resp->parm = static_cast<uint8_t>(BootOptionParameter::SET_IN_PROGRESS);
+        resp->data[0] = transferStatus;
+        return IPMI_CC_OK;
+    }
+
     std::memset(resp, 0, sizeof(*resp));
     resp->version = SET_PARM_VERSION;
     resp->parm = 5;
     resp->data[0] = SET_PARM_BOOT_FLAGS_VALID_ONE_TIME;
-
     /*
      * Parameter #5 means boot flags. Please refer to 28.13 of ipmi doc.
      * This is the only parameter used by petitboot.
@@ -1491,6 +1539,16 @@ ipmi_ret_t ipmi_chassis_set_sys_boot_options(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
     // This IPMI command does not have any resposne data
     *data_len = 0;
 
+    if (reqptr->parameter ==
+        static_cast<uint8_t>(BootOptionParameter::SET_IN_PROGRESS))
+    {
+        if (transferStatus == setInProgress) {
+            return IPMI_CC_FAIL_SET_IN_PROGRESS;
+        }
+        transferStatus = reqptr->data[0];
+        return IPMI_CC_OK;
+    }
+
     /*  000101
      * Parameter #5 means boot flags. Please refer to 28.13 of ipmi doc.
      * This is the only parameter used by petitboot.
@@ -1554,7 +1612,7 @@ ipmi_ret_t ipmi_chassis_set_sys_boot_options(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
                     setBootMode(Mode::Modes::Regular);
                 }
             }
-            if (modeIpmiToDbus.end() != modeItr)
+            else if (modeIpmiToDbus.end() != modeItr)
             {
                 rc = setBootMode(modeItr->second);
                 if (rc != IPMI_CC_OK)
@@ -1570,6 +1628,12 @@ ipmi_ret_t ipmi_chassis_set_sys_boot_options(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
                 {
                     setBootSource(Source::Sources::Default);
                 }
+            }
+            else
+            {
+                // if boot option is not in support list, return error
+                *data_len = 0;
+                return IPMI_CC_INVALID_FIELD_REQUEST;
             }
         }
         catch (InternalFailure& e)
@@ -1607,6 +1671,68 @@ ipmi_ret_t ipmi_chassis_set_sys_boot_options(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
                         entry("PARAM=0x%x", reqptr->parameter));
         rc = IPMI_CC_PARM_NOT_SUPPORTED;
     }
+
+    return rc;
+}
+
+namespace restart_cause
+{
+
+using namespace sdbusplus::xyz::openbmc_project::State::server;
+
+std::map<Host::RestartCause, uint8_t> dbusToIpmi = {
+    {Host::RestartCause::Unknown, 0x0},
+    {Host::RestartCause::IpmiCommand, 0x1},
+    {Host::RestartCause::ResetButton, 0x2},
+    {Host::RestartCause::PowerButton, 0x3},
+    {Host::RestartCause::WatchdogTimer, 0x4},
+    {Host::RestartCause::OEM, 0x5},
+    {Host::RestartCause::PowerPolicyAlwaysOn, 0x6},
+    {Host::RestartCause::PowerPolicyPreviousState, 0x7},
+    {Host::RestartCause::PEFReset, 0x8},
+    {Host::RestartCause::PEFPowerCycle, 0x9},
+    {Host::RestartCause::SoftReset, 0xa},
+    {Host::RestartCause::RTCWakeup, 0xb}};
+} // namespace restart_cause
+
+ipmi_ret_t ipmi_chassis_get_sys_restart_cause(
+    ipmi_netfn_t netfn, ipmi_cmd_t cmd, ipmi_request_t request,
+    ipmi_response_t response, ipmi_data_len_t data_len, ipmi_context_t context)
+{
+    ipmi_ret_t rc = IPMI_CC_OK;
+
+    GetSysRestartCauseResponse* resp = (GetSysRestartCauseResponse*)response;
+    std::fill(reinterpret_cast<uint8_t*>(resp),
+              reinterpret_cast<uint8_t*>(resp) + sizeof(*resp), 0);
+    if (*data_len != 0)
+    {
+        rc = IPMI_CC_REQ_DATA_LEN_INVALID;
+        return rc;
+    }
+
+    try
+    {
+        sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
+        ipmi::DbusObjectInfo hostObject =
+            ipmi::getDbusObject(bus, stateHostInterface);
+        ipmi::Value variant =
+            ipmi::getDbusProperty(bus, hostObject.second, hostObject.first,
+                                  hostRestartCauseInterface, hostRestartCause);
+
+        std::string restartCause =
+            sdbusplus::message::variant_ns::get<std::string>(variant);
+        resp->restartCause = restart_cause::dbusToIpmi.at(
+            restart_cause::Host::convertRestartCauseFromString(restartCause));
+    }
+
+    catch (std::exception& e)
+    {
+        log<level::ERR>(e.what());
+        rc = IPMI_CC_UNSPECIFIED_ERROR;
+        return rc;
+    }
+    resp->channelNum = 0; // Fix to primary channel.
+    *data_len = sizeof(GetSysRestartCauseResponse);
 
     return rc;
 }
@@ -1723,6 +1849,82 @@ ipmi_ret_t ipmi_chassis_set_power_restore_policy(
     return IPMI_CC_OK;
 }
 
+ipmi_ret_t ipmiSetFrontPanelButtonEnables(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
+                                          ipmi_request_t request,
+                                          ipmi_response_t response,
+                                          ipmi_data_len_t data_len,
+                                          ipmi_context_t context)
+{
+    bool enable = false;
+    constexpr const char* powerButtonIntf =
+        "xyz.openbmc_project.Chassis.Buttons.Power";
+    constexpr const char* powerButtonPath =
+        "/xyz/openbmc_project/Chassis/Buttons/Power0";
+    constexpr const char* resetButtonIntf =
+        "xyz.openbmc_project.Chassis.Buttons.Reset";
+    constexpr const char* resetButtonPath =
+        "/xyz/openbmc_project/Chassis/Buttons/Reset0";
+    using namespace chassis::internal;
+
+    IPMISetFrontPanelButtonEnablesReq* req =
+        static_cast<IPMISetFrontPanelButtonEnablesReq*>(request);
+    if (*data_len != 1)
+    {
+        *data_len = 0;
+        log<level::ERR>("IPMI request len is invalid");
+        return IPMI_CC_REQ_DATA_LEN_INVALID;
+    }
+    *data_len = 0;
+    if (req->disables & disablePowerButton)
+    {
+        // Disable power button
+        enable = false;
+    }
+    else
+    {
+        // Enable power button
+        enable = true;
+    }
+    // set power button Enabled property
+    try
+    {
+        auto service = ipmi::getService(dbus, powerButtonIntf, powerButtonPath);
+        ipmi::setDbusProperty(dbus, service, powerButtonPath, powerButtonIntf,
+                              "Enabled", enable);
+    }
+    catch (sdbusplus::exception::SdBusError& e)
+    {
+        log<level::ERR>(e.what());
+        log<level::ERR>("Fail to set power button Enabled property");
+        return IPMI_CC_UNSPECIFIED_ERROR;
+    }
+
+    if (req->disables & disableResetButton)
+    {
+        // disable reset button
+        enable = false;
+    }
+    else
+    {
+        // enable reset button
+        enable = true;
+    }
+    // set reset button Enabled property
+    try
+    {
+        auto service = ipmi::getService(dbus, resetButtonIntf, resetButtonPath);
+        ipmi::setDbusProperty(dbus, service, resetButtonPath, resetButtonIntf,
+                              "Enabled", enable);
+    }
+    catch (sdbusplus::exception::SdBusError& e)
+    {
+        log<level::ERR>(e.what());
+        log<level::ERR>("Fail to set reset button Enabled property");
+        return IPMI_CC_UNSPECIFIED_ERROR;
+    }
+    return IPMI_CC_OK;
+}
+
 void register_netfn_chassis_functions()
 {
     createIdentifyTimer();
@@ -1734,6 +1936,11 @@ void register_netfn_chassis_functions()
     // Get Chassis Capabilities
     ipmi_register_callback(NETFUN_CHASSIS, IPMI_CMD_GET_CHASSIS_CAP, NULL,
                            ipmi_get_chassis_cap, PRIVILEGE_USER);
+
+    // Set Front Panel Button Enables
+    ipmi_register_callback(NETFUN_CHASSIS,
+                           IPMI_CMD_SET_FRONT_PANEL_BUTTON_ENABLES, NULL,
+                           ipmiSetFrontPanelButtonEnables, PRIVILEGE_ADMIN);
 
     // Set Chassis Capabilities
     ipmi_register_callback(NETFUN_CHASSIS, IPMI_CMD_SET_CHASSIS_CAP, NULL,
@@ -1753,8 +1960,9 @@ void register_netfn_chassis_functions()
                            ipmi_chassis_control, PRIVILEGE_OPERATOR);
 
     // <Chassis Identify>
-    ipmi_register_callback(NETFUN_CHASSIS, IPMI_CMD_CHASSIS_IDENTIFY, NULL,
-                           ipmi_chassis_identify, PRIVILEGE_OPERATOR);
+    ipmi::registerHandler(ipmi::prioOpenBmcBase, ipmi::netFnChassis,
+                          ipmi::chassis::cmdChassisIdentify,
+                          ipmi::Privilege::Operator, ipmiChassisIdentify);
 
     // <Set System Boot Options>
     ipmi_register_callback(NETFUN_CHASSIS, IPMI_CMD_SET_SYS_BOOT_OPTIONS, NULL,
@@ -1768,4 +1976,8 @@ void register_netfn_chassis_functions()
     ipmi_register_callback(NETFUN_CHASSIS, IPMI_CMD_SET_RESTORE_POLICY, NULL,
                            ipmi_chassis_set_power_restore_policy,
                            PRIVILEGE_OPERATOR);
+
+    // <get Host Restart Cause>
+    ipmi_register_callback(NETFUN_CHASSIS, IPMI_CMD_GET_SYS_RESTART_CAUSE, NULL,
+                           ipmi_chassis_get_sys_restart_cause, PRIVILEGE_USER);
 }

@@ -1,15 +1,15 @@
 #include "transporthandler.hpp"
 
 #include "app/channel.hpp"
-#include "ipmid.hpp"
 #include "user_channel/channel_layer.hpp"
-#include "utils.hpp"
 
 #include <arpa/inet.h>
-#include <ipmid/api.h>
 
 #include <chrono>
+#include <filesystem>
 #include <fstream>
+#include <ipmid/api.hpp>
+#include <ipmid/utils.hpp>
 #include <phosphor-logging/elog-errors.hpp>
 #include <phosphor-logging/log.hpp>
 #include <sdbusplus/message/types.hpp>
@@ -24,23 +24,20 @@
 #include <systemd/sd-bus.h>
 #endif
 
-#if __has_include(<filesystem>)
-#include <filesystem>
-#elif __has_include(<experimental/filesystem>)
-#include <experimental/filesystem>
-namespace std
-{
-// splice experimental::filesystem into std
-namespace filesystem = std::experimental::filesystem;
-} // namespace std
-#else
-#error filesystem not available
-#endif
-
-extern std::unique_ptr<phosphor::Timer> networkTimer;
+// timer for network changes
+std::unique_ptr<phosphor::Timer> networkTimer = nullptr;
 
 const int SIZE_MAC = 18; // xx:xx:xx:xx:xx:xx
 constexpr auto ipv4Protocol = "xyz.openbmc_project.Network.IP.Protocol.IPv4";
+constexpr auto ipv6Protocol = "xyz.openbmc_project.Network.IP.Protocol.IPv6";
+
+static const std::array<std::string, 3> ipAddressEnablesType = {
+    "xyz.openbmc_project.Network.EthernetInterface.IPAllowed.IPv4Only",
+    "xyz.openbmc_project.Network.EthernetInterface.IPAllowed.IPv6Only",
+    "xyz.openbmc_project.Network.EthernetInterface.IPAllowed.IPv4AndIPv6"};
+
+constexpr const char* solInterface = "xyz.openbmc_project.Ipmi.SOL";
+constexpr const char* solPath = "/xyz/openbmc_project/ipmi/sol";
 
 std::map<int, std::unique_ptr<struct ChannelConfig_t>> channelConfig;
 
@@ -393,6 +390,35 @@ struct set_lan_t
     uint8_t data[8]; // Per IPMI spec, not expecting more than this size
 } __attribute__((packed));
 
+ipmi_ret_t checkAndUpdateNetwork(int channel)
+{
+    auto channelConf = getChannelConfig(channel);
+    using namespace std::chrono_literals;
+    // time to wait before applying the network changes.
+    constexpr auto networkTimeout = 10000000us; // 10 sec
+
+    // Skip the timer. Expecting more update as we are in SET_IN_PROGRESS
+    if (channelConf->lan_set_in_progress == SET_IN_PROGRESS)
+    {
+        return IPMI_CC_OK;
+    }
+
+    // Start the timer, if it is direct single param update without
+    // SET_IN_PROGRESS or many params updated through SET_IN_PROGRESS to
+    // SET_COMPLETE Note: Even for update with SET_IN_PROGRESS, don't apply the
+    // changes immediately, as ipmitool sends each param individually
+    // through SET_IN_PROGRESS to SET_COMPLETE.
+    channelConf->flush = true;
+    if (!networkTimer)
+    {
+        log<level::ERR>("Network timer is not instantiated");
+        return IPMI_CC_UNSPECIFIED_ERROR;
+    }
+    // start the timer.
+    networkTimer->start(networkTimeout);
+    return IPMI_CC_OK;
+}
+
 ipmi_ret_t ipmi_transport_set_lan(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
                                   ipmi_request_t request,
                                   ipmi_response_t response,
@@ -400,12 +426,6 @@ ipmi_ret_t ipmi_transport_set_lan(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
                                   ipmi_context_t context)
 {
     ipmi_ret_t rc = IPMI_CC_OK;
-    *data_len = 0;
-
-    using namespace std::chrono_literals;
-
-    // time to wait before applying the network changes.
-    constexpr auto networkTimeout = 10000000us; // 10 sec
 
     char ipaddr[INET_ADDRSTRLEN];
     char netmask[INET_ADDRSTRLEN];
@@ -413,6 +433,9 @@ ipmi_ret_t ipmi_transport_set_lan(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
 
     auto reqptr = reinterpret_cast<const set_lan_t*>(request);
     sdbusplus::bus::bus bus(ipmid_get_sd_bus_connection());
+
+    size_t reqLen = *data_len;
+    *data_len = 0;
 
     // channel number is the lower nibble
     int channel = reqptr->channel & CHANNEL_MASK;
@@ -437,6 +460,11 @@ ipmi_ret_t ipmi_transport_set_lan(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
 
         case LanParam::IPSRC:
         {
+            if (reqLen != LAN_PARAM_IPSRC_SIZE)
+            {
+                return IPMI_CC_REQ_DATA_LEN_INVALID;
+            }
+
             uint8_t ipsrc{};
             std::memcpy(&ipsrc, reqptr->data, ipmi::network::IPSRC_SIZE_BYTE);
             channelConf->ipsrc = static_cast<ipmi::network::IPOrigin>(ipsrc);
@@ -445,6 +473,11 @@ ipmi_ret_t ipmi_transport_set_lan(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
 
         case LanParam::MAC:
         {
+            if (reqLen != LAN_PARAM_MAC_SIZE)
+            {
+                return IPMI_CC_REQ_DATA_LEN_INVALID;
+            }
+
             char mac[SIZE_MAC];
 
             std::snprintf(mac, SIZE_MAC, ipmi::network::MAC_ADDRESS_FORMAT,
@@ -465,6 +498,11 @@ ipmi_ret_t ipmi_transport_set_lan(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
 
         case LanParam::SUBNET:
         {
+            if (reqLen != LAN_PARAM_SUBNET_SIZE)
+            {
+                return IPMI_CC_REQ_DATA_LEN_INVALID;
+            }
+
             std::snprintf(netmask, INET_ADDRSTRLEN,
                           ipmi::network::IP_ADDRESS_FORMAT, reqptr->data[0],
                           reqptr->data[1], reqptr->data[2], reqptr->data[3]);
@@ -474,6 +512,11 @@ ipmi_ret_t ipmi_transport_set_lan(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
 
         case LanParam::GATEWAY:
         {
+            if (reqLen != LAN_PARAM_GATEWAY_SIZE)
+            {
+                return IPMI_CC_REQ_DATA_LEN_INVALID;
+            }
+
             std::snprintf(gateway, INET_ADDRSTRLEN,
                           ipmi::network::IP_ADDRESS_FORMAT, reqptr->data[0],
                           reqptr->data[1], reqptr->data[2], reqptr->data[3]);
@@ -483,6 +526,11 @@ ipmi_ret_t ipmi_transport_set_lan(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
 
         case LanParam::VLAN:
         {
+            if (reqLen != LAN_PARAM_VLAN_SIZE)
+            {
+                return IPMI_CC_REQ_DATA_LEN_INVALID;
+            }
+
             uint16_t vlan{};
             std::memcpy(&vlan, reqptr->data, ipmi::network::VLAN_SIZE_BYTE);
             // We are not storing the enable bit
@@ -495,6 +543,11 @@ ipmi_ret_t ipmi_transport_set_lan(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
 
         case LanParam::INPROGRESS:
         {
+            if (reqLen != LAN_PARAM_INPROGRESS_SIZE)
+            {
+                return IPMI_CC_REQ_DATA_LEN_INVALID;
+            }
+
             if (reqptr->data[0] == SET_COMPLETE)
             {
                 channelConf->lan_set_in_progress = SET_COMPLETE;
@@ -505,29 +558,137 @@ ipmi_ret_t ipmi_transport_set_lan(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
                     entry("ADDRESS=%s", channelConf->ipaddr.c_str()),
                     entry("GATEWAY=%s", channelConf->gateway.c_str()),
                     entry("VLAN=%d", channelConf->vlanID));
-
-                if (!networkTimer)
-                {
-                    log<level::ERR>("Network timer is not instantiated");
-                    return IPMI_CC_UNSPECIFIED_ERROR;
-                }
-
-                // start/restart the timer
-                networkTimer->start(networkTimeout);
             }
             else if (reqptr->data[0] == SET_IN_PROGRESS) // Set In Progress
             {
                 channelConf->lan_set_in_progress = SET_IN_PROGRESS;
-                channelConf->flush = true;
             }
         }
         break;
 
+        case LanParam::IPV6_AND_IPV4_ENABLES:
+        {
+            if (reqLen != LAN_PARAM_IPV6_AND_IPV4_ENABLES_SIZE)
+            {
+                return IPMI_CC_REQ_DATA_LEN_INVALID;
+            }
+
+            channelConf->ipv6AddressingEnables = reqptr->data[0];
+            break;
+        }
+
+        case LanParam::IPV6_STATIC_ADDRESSES:
+        {
+            if (reqLen != LAN_PARAM_IPV6_STATIC_ADDRESSES_SIZE)
+            {
+                return IPMI_CC_REQ_DATA_LEN_INVALID;
+            }
+
+            channelConf->ipv6AddressSource =
+                reqptr->data[1] & 0x81; // Looking at bit 0 and bit 7
+            char tmpIPV6[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, &reqptr->data[2], tmpIPV6, INET6_ADDRSTRLEN);
+            channelConf->ipv6Addr.assign(tmpIPV6);
+            channelConf->ipv6Prefix = reqptr->data[19];
+            break;
+        }
+
+        case LanParam::IPV6_ROUTER_ADDRESS_CONF_CTRL:
+        {
+            if (reqLen != LAN_PARAM_IPV6_ROUTER_ADDRESS_CONF_CTRL_SIZE)
+            {
+                return IPMI_CC_REQ_DATA_LEN_INVALID;
+            }
+
+            channelConf->ipv6RouterAddressConfigControl = reqptr->data[0];
+            break;
+        }
+
+        case LanParam::IPV6_STATIC_ROUTER_1_IP_ADDR:
+        {
+            if (reqLen != LAN_PARAM_IPV6_STATIC_ROUTER_1_IP_ADDR_SIZE)
+            {
+                return IPMI_CC_REQ_DATA_LEN_INVALID;
+            }
+
+            char tmpIPV6[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, reinterpret_cast<const void*>(reqptr->data),
+                      tmpIPV6, INET6_ADDRSTRLEN);
+            channelConf->ipv6GatewayAddr.assign(tmpIPV6);
+            break;
+        }
+
+        case LanParam::IPV6_STATIC_ROUTER_1_PREFIX_LEN:
+        {
+            if (reqLen != LAN_PARAM_IPV6_STATIC_ROUTER_1_PREFIX_LEN_SIZE)
+            {
+                return IPMI_CC_REQ_DATA_LEN_INVALID;
+            }
+
+            channelConf->ipv6GatewayPrefixLength = reqptr->data[0];
+            break;
+        }
+
+        case LanParam::IPV6_STATIC_ROUTER_1_PREFIX_VAL:
+        {
+            if (reqLen != LAN_PARAM_IPV6_STATIC_ROUTER_1_PREFIX_VAL_SIZE)
+            {
+                return IPMI_CC_REQ_DATA_LEN_INVALID;
+            }
+
+            char tmpIPV6[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, reinterpret_cast<const void*>(reqptr->data),
+                      tmpIPV6, INET6_ADDRSTRLEN);
+            channelConf->ipv6GatewayPrefixValue.assign(tmpIPV6);
+            break;
+        }
+
+        case LanParam::IPV6_STATIC_ROUTER_2_IP_ADDR:
+        {
+            if (reqLen != LAN_PARAM_IPV6_STATIC_ROUTER_2_IP_ADDR_SIZE)
+            {
+                return IPMI_CC_REQ_DATA_LEN_INVALID;
+            }
+
+            char tmpIPV6[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, reinterpret_cast<const void*>(reqptr->data),
+                      tmpIPV6, INET6_ADDRSTRLEN);
+            channelConf->ipv6BackupGatewayAddr.assign(tmpIPV6);
+            break;
+        }
+
+        case LanParam::IPV6_STATIC_ROUTER_2_PREFIX_LEN:
+        {
+            if (reqLen != LAN_PARAM_IPV6_STATIC_ROUTER_2_PREFIX_LEN_SIZE)
+            {
+                return IPMI_CC_REQ_DATA_LEN_INVALID;
+            }
+
+            channelConf->ipv6BackupGatewayPrefixLength = reqptr->data[0];
+            break;
+        }
+
+        case LanParam::IPV6_STATIC_ROUTER_2_PREFIX_VAL:
+        {
+            if (reqLen != LAN_PARAM_IPV6_STATIC_ROUTER_2_PREFIX_VAL_SIZE)
+            {
+                return IPMI_CC_REQ_DATA_LEN_INVALID;
+            }
+
+            char tmpIPV6[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, reinterpret_cast<const void*>(reqptr->data),
+                      tmpIPV6, INET6_ADDRSTRLEN);
+            channelConf->ipv6BackupGatewayPrefixValue.assign(tmpIPV6);
+            break;
+        }
+
         default:
         {
             rc = IPMI_CC_PARM_NOT_SUPPORTED;
+            return rc;
         }
     }
+    rc = checkAndUpdateNetwork(channel);
 
     return rc;
 }
@@ -549,6 +710,7 @@ ipmi_ret_t ipmi_transport_get_lan(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
     ipmi_ret_t rc = IPMI_CC_OK;
     *data_len = 0;
     const uint8_t current_revision = 0x11; // Current rev per IPMI Spec 2.0
+    sdbusplus::bus::bus bus{ipmid_get_sd_bus_connection()};
 
     get_lan_t* reqptr = (get_lan_t*)request;
     // channel number is the lower nibble
@@ -685,6 +847,476 @@ ipmi_ret_t ipmi_transport_get_lan(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
                         static_cast<uint8_t*>(response) + 1);
             *data_len = sizeof(current_revision) +
                         static_cast<uint8_t>(cipherList.size());
+            break;
+        }
+        case LanParam::IPV6_AND_IPV4_SUPPORTED:
+        {
+            uint8_t addressSupport =
+                0x1; // Allow both IPv4 & IPv6 simultaneously
+            std::array<uint8_t, 2> buf = {current_revision, addressSupport};
+            std::copy(buf.begin(), buf.end(), static_cast<uint8_t*>(response));
+            *data_len = buf.size();
+            break;
+        }
+        case LanParam::IPV6_AND_IPV4_ENABLES:
+        {
+            // If DHCP, check if you have an ipv6 and ipv4 address. If static
+            // return not supported
+
+            // 00h check if conf DHCP == ipv4 or off
+            // 01h check if conf DHCP == ipv6
+            // 02h check if DHCP == true
+
+            auto ethIP = ethdevice + "/" + ipmi::network::IPV6_TYPE;
+            std::string networkInterfacePath;
+            uint8_t ipVAddressEnables = 0;
+
+            if (channelConf->lan_set_in_progress == SET_COMPLETE)
+            {
+                try
+                {
+                    ipmi::ObjectTree ancestorMap;
+                    // if the system has an ip object,then
+                    // get the IP object.
+                    auto ipObject =
+                        ipmi::getDbusObject(bus, ipmi::network::IP_INTERFACE,
+                                            ipmi::network::ROOT, ethIP);
+                    // Get the parent interface of the IP object.
+                    try
+                    {
+                        ipmi::InterfaceList interfaces;
+                        interfaces.emplace_back(
+                            ipmi::network::ETHERNET_INTERFACE);
+
+                        ancestorMap = ipmi::getAllAncestors(
+                            bus, ipObject.first, std::move(interfaces));
+                    }
+                    catch (InternalFailure& e)
+                    {
+                        // if unable to get the parent interface
+                        // then commit the error and return.
+                        log<level::ERR>(
+                            "Unable to get the parent interface",
+                            entry("PATH=%s", ipObject.first.c_str()),
+                            entry("INTERFACE=%s",
+                                  ipmi::network::ETHERNET_INTERFACE));
+                        return IPMI_CC_UNSPECIFIED_ERROR;
+                    }
+                    // for an ip object there would be single parent
+                    // interface.
+                    networkInterfacePath = ancestorMap.begin()->first;
+                }
+                catch (InternalFailure& e)
+                {
+                    // if there is no ip configured on the system,then
+                    // get the network interface object.
+                    auto networkInterfaceObject = ipmi::getDbusObject(
+                        bus, ipmi::network::ETHERNET_INTERFACE,
+                        ipmi::network::ROOT, ethdevice);
+
+                    networkInterfacePath = networkInterfaceObject.first;
+                }
+
+                ipmi::Value ipEnablesProp = ipmi::getDbusProperty(
+                    bus, ipmi::network::SERVICE, networkInterfacePath,
+                    ipmi::network::ETHERNET_INTERFACE, "IPAddressEnables");
+                std::string ipEnables = std::get<std::string>(ipEnablesProp);
+
+                // check if on off ipv4 ipv6, etc.
+                bool found = false;
+                for (uint8_t ii = 0; ii < ipAddressEnablesType.size(); ii++)
+                {
+                    if (ipEnables == ipAddressEnablesType[ii])
+                    {
+                        ipVAddressEnables = ii;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                {
+                    return IPMI_CC_PARM_NOT_SUPPORTED;
+                }
+            }
+            else
+            {
+                ipVAddressEnables = channelConf->ipv6AddressingEnables;
+            }
+
+            std::array<uint8_t, 2> buf = {current_revision, ipVAddressEnables};
+            std::copy(buf.begin(), buf.end(), static_cast<uint8_t*>(response));
+            *data_len = buf.size();
+            break;
+        }
+        case LanParam::IPV6_STATUS:
+        {
+            // Number of IPV6 addresses that are supported
+            constexpr std::array<uint8_t, 3> statusData = {1, 1, 3};
+
+            std::array<uint8_t, 4> buf = {current_revision, statusData[0],
+                                          statusData[1], statusData[2]};
+            std::copy(buf.begin(), buf.end(), static_cast<uint8_t*>(response));
+            *data_len = buf.size();
+            break;
+        }
+        case LanParam::IPV6_STATIC_ADDRESSES:
+        {
+            // Only return set selector 0
+            uint8_t ipv6SetSelector = 0;
+            std::string ipaddress;
+            auto ethIP = ethdevice + "/" + ipmi::network::IPV6_TYPE;
+            uint8_t ipv6AddressSource = 0;
+            uint8_t prefixLength = 0;
+            uint8_t status = 0;
+            if (channelConf->lan_set_in_progress == SET_COMPLETE)
+            {
+                try
+                {
+                    auto ipObjectInfo =
+                        ipmi::getIPObject(bus, ipmi::network::IP_INTERFACE,
+                                          ipmi::network::ROOT, ethIP);
+
+                    auto properties = ipmi::getAllDbusProperties(
+                        bus, ipObjectInfo.second, ipObjectInfo.first,
+                        ipmi::network::IP_INTERFACE);
+
+                    if (std::get<std::string>(properties["Origin"]) ==
+                        "xyz.openbmc_project.Network.IP.AddressOrigin.Static")
+                    {
+                        ipaddress =
+                            std::get<std::string>(properties["Address"]);
+                        ipv6AddressSource = 0x81; // Looking at bit 0 and bit 7
+                        prefixLength =
+                            std::get<uint8_t>(properties["PrefixLength"]);
+                        status = 0;
+                    }
+                }
+                // ignore the exception, as it is a valid condition that
+                // the system is not configured with any IP.
+                catch (InternalFailure& e)
+                {
+                    // nothing to do.
+                }
+            }
+            else if (channelConf->lan_set_in_progress == SET_IN_PROGRESS)
+            {
+                ipv6AddressSource = channelConf->ipv6AddressSource;
+                ipaddress = channelConf->ipv6Addr.c_str();
+                prefixLength = channelConf->ipv6Prefix;
+                status = 1;
+            }
+
+            std::array<uint8_t, ipmi::network::IPV6_ADDRESS_STATUS_SIZE> buf = {
+                current_revision, ipv6SetSelector, ipv6AddressSource};
+            inet_pton(AF_INET6, ipaddress.c_str(),
+                      reinterpret_cast<void*>(&buf[3]));
+            buf[20] = prefixLength;
+            buf[21] = status;
+
+            std::copy(buf.begin(), buf.end(), static_cast<uint8_t*>(response));
+            *data_len = buf.size();
+            break;
+        }
+        case LanParam::IPV6_DHCPV6_STATIC_DUID_STORAGE_LENGTH:
+        {
+            // DHCP unique identified
+            // Only 1 read-only 16-byte Block needed
+            uint8_t duidLength = 1;
+            std::array<uint8_t, 2> buf = {current_revision, duidLength};
+            std::copy(buf.begin(), buf.end(), static_cast<uint8_t*>(response));
+            *data_len = buf.size();
+            break;
+        }
+        case LanParam::IPV6_DHCPV6_STATIC_DUIDS:
+        {
+            std::string macAddress;
+            if (channelConf->lan_set_in_progress == SET_COMPLETE)
+            {
+                auto macObjectInfo =
+                    ipmi::getDbusObject(bus, ipmi::network::MAC_INTERFACE,
+                                        ipmi::network::ROOT, ethdevice);
+
+                auto variant = ipmi::getDbusProperty(
+                    bus, macObjectInfo.second, macObjectInfo.first,
+                    ipmi::network::MAC_INTERFACE, "MACAddress");
+
+                macAddress = std::get<std::string>(variant);
+            }
+            else if (channelConf->lan_set_in_progress == SET_IN_PROGRESS)
+            {
+                macAddress = channelConf->macAddress;
+            }
+
+            std::array<uint8_t,
+                       ipmi::network::IPV6_DUID_SIZE + sizeof(current_revision)>
+                buf;
+            buf = {current_revision,
+                   reqptr->parameter_set,
+                   reqptr->parameter_block,
+                   DUID_LEN,
+                   0, // Filler byte
+                   DUID_LL_TYPE,
+                   0, // Filler byte
+                   DUIC_ETH_HW_TYPE};
+            sscanf(macAddress.c_str(), ipmi::network::MAC_ADDRESS_FORMAT,
+                   (&buf[8]), (&buf[9]), (&buf[10]), (&buf[11]), (&buf[12]),
+                   (&buf[13]));
+
+            std::copy(buf.begin(), buf.end(), static_cast<uint8_t*>(response));
+            *data_len = buf.size();
+            break;
+        }
+        case LanParam::IPV6_DYNAMIC_ADDRESSES:
+        {
+            std::string ipaddress;
+            uint8_t ipv6AddressSource = 0;
+            uint8_t prefixLength = 0;
+            uint8_t status = 0;
+            auto ethIP = ethdevice + "/" + ipmi::network::IPV6_TYPE;
+
+            if (channelConf->lan_set_in_progress == SET_COMPLETE)
+            {
+                try
+                {
+                    auto ipObjectInfo =
+                        ipmi::getIPObject(bus, ipmi::network::IP_INTERFACE,
+                                          ipmi::network::ROOT, ethIP);
+
+                    auto properties = ipmi::getAllDbusProperties(
+                        bus, ipObjectInfo.second, ipObjectInfo.first,
+                        ipmi::network::IP_INTERFACE);
+
+                    if (std::get<std::string>(properties["Origin"]) ==
+                        "xyz.openbmc_project.Network.IP.AddressOrigin.DHCP")
+                    {
+                        ipaddress =
+                            std::get<std::string>(properties["Address"]);
+                        ipv6AddressSource = 0x81; // Looking at bit 0 and bit 7
+                        prefixLength =
+                            std::get<uint8_t>(properties["PrefixLength"]);
+                        status = 0;
+                    }
+                    else
+                    {
+                        status = 1;
+                    }
+                }
+                // ignore the exception, as it is a valid condition that
+                // the system is not configured with any IP.
+                catch (InternalFailure& e)
+                {
+                    // nothing to do.
+                }
+            }
+            else if (channelConf->lan_set_in_progress == SET_IN_PROGRESS)
+            {
+                ipaddress = channelConf->ipv6Addr;
+                ipv6AddressSource = channelConf->ipv6AddressSource;
+                prefixLength = channelConf->ipv6Prefix;
+                status = channelConf->ipv6AddressStatus;
+            }
+
+            uint8_t ipv6SetSelector = 0;
+            std::array<uint8_t, 22> buf = {current_revision, ipv6SetSelector,
+                                           ipv6AddressSource};
+            inet_pton(AF_INET6, ipaddress.c_str(),
+                      reinterpret_cast<void*>(&buf[3]));
+            buf[20] = prefixLength;
+            buf[21] = status;
+
+            std::copy(buf.begin(), buf.end(), static_cast<uint8_t*>(response));
+            *data_len = buf.size();
+            break;
+        }
+        case LanParam::IPV6_DHCPV6_DYNAMIC_DUID_STOR_LEN:
+        {
+            uint8_t duidLength = 0;
+            // Only 1 read-only 16-byte Block needed
+            duidLength = 1;
+
+            std::array<uint8_t, 2> buf = {current_revision, duidLength};
+            std::copy(buf.begin(), buf.end(), static_cast<uint8_t*>(response));
+            *data_len = buf.size();
+            break;
+        }
+        case LanParam::IPV6_DHCPV6_DYNAMIC_DUIDS:
+        {
+            std::string macAddress;
+            if (channelConf->lan_set_in_progress == SET_COMPLETE)
+            {
+                auto macObjectInfo =
+                    ipmi::getDbusObject(bus, ipmi::network::MAC_INTERFACE,
+                                        ipmi::network::ROOT, ethdevice);
+
+                auto variant = ipmi::getDbusProperty(
+                    bus, macObjectInfo.second, macObjectInfo.first,
+                    ipmi::network::MAC_INTERFACE, "MACAddress");
+
+                macAddress = std::get<std::string>(variant);
+            }
+            else if (channelConf->lan_set_in_progress == SET_IN_PROGRESS)
+            {
+                macAddress = channelConf->macAddress;
+            }
+
+            std::array<uint8_t,
+                       ipmi::network::IPV6_DUID_SIZE + sizeof(current_revision)>
+                buf;
+            buf = {current_revision,
+                   reqptr->parameter_set,
+                   reqptr->parameter_block,
+                   DUID_LEN,
+                   0, // Filler byte
+                   DUID_LL_TYPE,
+                   0, // Filler byte
+                   DUIC_ETH_HW_TYPE};
+
+            sscanf(macAddress.c_str(), ipmi::network::MAC_ADDRESS_FORMAT,
+                   (&buf[8]), (&buf[9]), (&buf[10]), (&buf[11]), (&buf[12]),
+                   (&buf[13]));
+
+            std::copy(buf.begin(), buf.end(), static_cast<uint8_t*>(response));
+            *data_len = buf.size();
+            break;
+        }
+        case LanParam::IPV6_ROUTER_ADDRESS_CONF_CTRL:
+        {
+            // Determine if automated router discovery occurs when static
+            // addresses are used for the bmc
+
+            auto ethIP = ethdevice + "/" + ipmi::network::IPV6_TYPE;
+            std::string networkInterfacePath;
+            uint8_t dynamicRA;
+            if (channelConf->lan_set_in_progress == SET_COMPLETE)
+            {
+
+                try
+                {
+                    ipmi::ObjectTree ancestorMap;
+                    // if the system is having ip object,then
+                    // get the IP object.
+                    auto ipObject =
+                        ipmi::getDbusObject(bus, ipmi::network::IP_INTERFACE,
+                                            ipmi::network::ROOT, ethIP);
+
+                    // Get the parent interface of the IP object.
+                    try
+                    {
+                        ipmi::InterfaceList interfaces;
+                        interfaces.emplace_back(
+                            ipmi::network::ETHERNET_INTERFACE);
+
+                        ancestorMap = ipmi::getAllAncestors(
+                            bus, ipObject.first, std::move(interfaces));
+                    }
+                    catch (InternalFailure& e)
+                    {
+                        // if unable to get the parent interface
+                        // then commit the error and return.
+                        log<level::ERR>(
+                            "Unable to get the parent interface",
+                            entry("PATH=%s", ipObject.first.c_str()),
+                            entry("INTERFACE=%s",
+                                  ipmi::network::ETHERNET_INTERFACE));
+                        return IPMI_CC_UNSPECIFIED_ERROR;
+                    }
+                    // for an ip object there would be single parent
+                    // interface.
+                    networkInterfacePath = ancestorMap.begin()->first;
+                }
+                catch (InternalFailure& e)
+                {
+                    // if there is no ip configured on the system,then
+                    // get the network interface object.
+                    auto networkInterfaceObject = ipmi::getDbusObject(
+                        bus, ipmi::network::ETHERNET_INTERFACE,
+                        ipmi::network::ROOT, ethdevice);
+
+                    networkInterfacePath = networkInterfaceObject.first;
+                }
+
+                auto variant = ipmi::getDbusProperty(
+                    bus, ipmi::network::SERVICE, networkInterfacePath,
+                    ipmi::network::ETHERNET_INTERFACE, "IPv6AcceptRA");
+                dynamicRA = std::get<bool>(variant);
+            }
+            else
+            {
+                dynamicRA = channelConf->ipv6RouterAddressConfigControl;
+            }
+
+            std::array<uint8_t, 2> buf = {current_revision, dynamicRA};
+            std::copy(buf.begin(), buf.end(), static_cast<uint8_t*>(response));
+            *data_len = buf.size();
+            break;
+        }
+        case LanParam::IPV6_STATIC_ROUTER_1_IP_ADDR:
+        {
+            std::array<uint8_t, ipmi::network::IPV6_ADDRESS_SIZE_BYTE +
+                                    sizeof(current_revision)>
+                buf = {current_revision};
+            inet_pton(AF_INET6, channelConf->ipv6GatewayAddr.c_str(),
+                      reinterpret_cast<void*>(&buf[1]));
+            std::copy(buf.begin(), buf.end(), static_cast<uint8_t*>(response));
+            *data_len = buf.size();
+            break;
+        }
+        case LanParam::IPV6_STATIC_ROUTER_1_PREFIX_LEN:
+        {
+            std::array<uint8_t, 2> buf = {current_revision,
+                                          channelConf->ipv6GatewayPrefixLength};
+            std::copy(buf.begin(), buf.end(), static_cast<uint8_t*>(response));
+            *data_len = buf.size();
+            break;
+        }
+        case LanParam::IPV6_STATIC_ROUTER_1_PREFIX_VAL:
+        {
+            constexpr uint8_t setSelector = 0;
+            std::array<uint8_t, sizeof(setSelector) +
+                                    ipmi::network::IPV6_ADDRESS_SIZE_BYTE +
+                                    sizeof(current_revision)>
+                buf = {current_revision, setSelector};
+
+            inet_pton(AF_INET6, channelConf->ipv6GatewayPrefixValue.c_str(),
+                      reinterpret_cast<void*>(&buf[2]));
+
+            std::copy(buf.begin(), buf.end(), static_cast<uint8_t*>(response));
+            *data_len = buf.size();
+            break;
+        }
+        case LanParam::IPV6_STATIC_ROUTER_2_IP_ADDR:
+        {
+            std::array<uint8_t, ipmi::network::IPV6_ADDRESS_SIZE_BYTE +
+                                    sizeof(current_revision)>
+                buf = {current_revision};
+            inet_pton(AF_INET6, channelConf->ipv6BackupGatewayAddr.c_str(),
+                      reinterpret_cast<void*>(&buf[1]));
+            std::copy(buf.begin(), buf.end(), static_cast<uint8_t*>(response));
+            *data_len = buf.size();
+            break;
+        }
+        case LanParam::IPV6_STATIC_ROUTER_2_PREFIX_LEN:
+        {
+            std::array<uint8_t, 2> buf = {
+                current_revision, channelConf->ipv6BackupGatewayPrefixLength};
+            std::copy(buf.begin(), buf.end(), static_cast<uint8_t*>(response));
+            *data_len = buf.size();
+            break;
+        }
+        case LanParam::IPV6_STATIC_ROUTER_2_PREFIX_VAL:
+        {
+
+            constexpr uint8_t setSelector = 0;
+            std::array<uint8_t, sizeof(setSelector) +
+                                    ipmi::network::IPV6_ADDRESS_SIZE_BYTE +
+                                    sizeof(current_revision)>
+                buf = {current_revision, setSelector};
+            inet_pton(AF_INET6,
+                      channelConf->ipv6BackupGatewayPrefixValue.c_str(),
+                      reinterpret_cast<void*>(&buf[2]));
+
+            std::copy(buf.begin(), buf.end(), static_cast<uint8_t*>(response));
+            *data_len = buf.size();
             break;
         }
         default:
@@ -932,6 +1564,16 @@ void applyChanges(int channel)
                                         ipaddress, prefix);
             }
 
+            if (!channelConf->ipv6Addr.empty() &&
+                channelConf->ipv6AddressSource ==
+                    0x80) // Check if IPv6 static addresses are enabled
+            {
+                ipmi::network::createIP(bus, ipmi::network::SERVICE,
+                                        networkInterfacePath, ipv6Protocol,
+                                        channelConf->ipv6Addr,
+                                        channelConf->ipv6Prefix);
+            }
+
             if (!gateway.empty())
             {
                 ipmi::setDbusProperty(bus, systemObject.second,
@@ -939,9 +1581,26 @@ void applyChanges(int channel)
                                       ipmi::network::SYSTEMCONFIG_INTERFACE,
                                       "DefaultGateway", std::string(gateway));
             }
+            else if (!channelConf->ipv6GatewayAddr.empty())
+            {
+                ipmi::setDbusProperty(
+                    bus, systemObject.second, systemObject.first,
+                    ipmi::network::SYSTEMCONFIG_INTERFACE, "DefaultGateway",
+                    std::string(channelConf->ipv6GatewayAddr));
+            }
         }
+        // set IPAddress Enables
+        ipmi::setDbusProperty(
+            bus, ipmi::network::SERVICE, networkInterfaceObject.first,
+            ipmi::network::ETHERNET_INTERFACE, "IPAddressEnables",
+            ipAddressEnablesType[channelConf->ipv6AddressingEnables]);
+
+        ipmi::setDbusProperty(
+            bus, ipmi::network::SERVICE, networkInterfaceObject.first,
+            ipmi::network::ETHERNET_INTERFACE, "IPv6AcceptRA",
+            (bool)channelConf->ipv6RouterAddressConfigControl);
     }
-    catch (InternalFailure& e)
+    catch (sdbusplus::exception::exception& e)
     {
         log<level::ERR>(
             "Failed to set network data", entry("PREFIX=%d", prefix),
@@ -977,6 +1636,341 @@ void createNetworkTimer()
     }
 }
 
+static int setSOLParameter(std::string property, const ipmi::Value& value)
+{
+    auto dbus = getSdBus();
+
+    static std::string solService{};
+    if (solService.empty())
+    {
+        try
+        {
+            solService = ipmi::getService(*dbus, solInterface, solPath);
+        }
+        catch (const sdbusplus::exception::SdBusError& e)
+        {
+            solService.clear();
+            phosphor::logging::log<phosphor::logging::level::ERR>(
+                "Error: get SOL service failed");
+            return -1;
+        }
+    }
+    try
+    {
+        ipmi::setDbusProperty(*dbus, solService, solPath, solInterface,
+                              property, value);
+    }
+    catch (sdbusplus::exception_t&)
+    {
+        phosphor::logging::log<phosphor::logging::level::ERR>(
+            "Error setting sol parameter");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int getSOLParameter(std::string property, ipmi::Value& value)
+{
+    auto dbus = getSdBus();
+
+    static std::string solService{};
+    if (solService.empty())
+    {
+        try
+        {
+            solService = ipmi::getService(*dbus, solInterface, solPath);
+        }
+        catch (const sdbusplus::exception::SdBusError& e)
+        {
+            solService.clear();
+            phosphor::logging::log<phosphor::logging::level::ERR>(
+                "Error: get SOL service failed");
+            return -1;
+        }
+    }
+    try
+    {
+        value = ipmi::getDbusProperty(*dbus, solService, solPath, solInterface,
+                                      property);
+    }
+    catch (sdbusplus::exception_t&)
+    {
+        phosphor::logging::log<phosphor::logging::level::ERR>(
+            "Error getting sol parameter");
+        return -1;
+    }
+
+    return 0;
+}
+
+void initializeSOLInProgress()
+{
+    if (setSOLParameter("Progress", static_cast<uint8_t>(0)) < 0)
+    {
+        phosphor::logging::log<phosphor::logging::level::ERR>(
+            "Error initialize sol progress");
+    }
+}
+
+//    For getsetSOLConfParams, there are still three tings TODO:
+//    1. session less channel number request has to return error.
+//    2. convert 0xE channel number.
+//    3. have unique object for every session based channel.
+ipmi_ret_t getSOLConfParams(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
+                            ipmi_request_t request, ipmi_response_t response,
+                            ipmi_data_len_t dataLen, ipmi_context_t context)
+{
+    auto reqData = reinterpret_cast<const GetSOLConfParamsRequest*>(request);
+    std::vector<uint8_t> outPayload;
+
+    if (*dataLen < sizeof(GetSOLConfParamsRequest) - 2)
+    {
+        *dataLen = 0;
+        return IPMI_CC_REQ_DATA_LEN_INVALID;
+    }
+
+    *dataLen = 0;
+
+    outPayload.push_back(solParameterRevision);
+    if (reqData->getParamRev)
+    {
+        std::copy(outPayload.begin(), outPayload.end(),
+                  static_cast<uint8_t*>(response));
+        *dataLen = outPayload.size();
+        return IPMI_CC_OK;
+    }
+
+    ipmi::Value value;
+    switch (static_cast<sol::Parameter>(reqData->paramSelector))
+    {
+        case sol::Parameter::progress:
+        {
+            if (getSOLParameter("Progress", value) < 0)
+            {
+                return IPMI_CC_UNSPECIFIED_ERROR;
+            }
+            outPayload.push_back(std::get<uint8_t>(value));
+            break;
+        }
+        case sol::Parameter::enable:
+        {
+            if (getSOLParameter("Enable", value) < 0)
+            {
+                return IPMI_CC_UNSPECIFIED_ERROR;
+            }
+            outPayload.push_back(static_cast<uint8_t>(std::get<bool>(value)));
+            break;
+        }
+        case sol::Parameter::authentication:
+        {
+            uint8_t authentication = 0;
+            if (getSOLParameter("Privilege", value) < 0)
+            {
+                return IPMI_CC_UNSPECIFIED_ERROR;
+            }
+            authentication = (std::get<uint8_t>(value) & 0x0f);
+
+            if (getSOLParameter("ForceAuthentication", value) < 0)
+            {
+                return IPMI_CC_UNSPECIFIED_ERROR;
+            }
+            authentication |=
+                (static_cast<uint8_t>(std::get<bool>(value)) << 6);
+
+            if (getSOLParameter("ForceEncryption", value) < 0)
+            {
+                return IPMI_CC_UNSPECIFIED_ERROR;
+            }
+            authentication |=
+                (static_cast<uint8_t>(std::get<bool>(value)) << 7);
+            outPayload.push_back(authentication);
+            break;
+        }
+        case sol::Parameter::accumulate:
+        {
+            if (getSOLParameter("AccumulateIntervalMS", value) < 0)
+            {
+                return IPMI_CC_UNSPECIFIED_ERROR;
+            }
+            outPayload.push_back(std::get<uint8_t>(value));
+
+            if (getSOLParameter("Threshold", value) < 0)
+            {
+                return IPMI_CC_UNSPECIFIED_ERROR;
+            }
+            outPayload.push_back(std::get<uint8_t>(value));
+            break;
+        }
+        case sol::Parameter::retry:
+        {
+            if (getSOLParameter("RetryCount", value) < 0)
+            {
+                return IPMI_CC_UNSPECIFIED_ERROR;
+            }
+            outPayload.push_back(std::get<uint8_t>(value) & 0x03);
+
+            if (getSOLParameter("RetryIntervalMS", value) < 0)
+            {
+                return IPMI_CC_UNSPECIFIED_ERROR;
+            }
+            outPayload.push_back(std::get<uint8_t>(value));
+            break;
+        }
+        case sol::Parameter::port:
+        {
+            uint16_t port = htole16(ipmiStdPort);
+            auto buffer = reinterpret_cast<const uint8_t*>(&port);
+            std::copy(buffer, buffer + sizeof(port),
+                      std::back_inserter(outPayload));
+            break;
+        }
+        default:
+            return IPMI_CC_PARM_NOT_SUPPORTED;
+    }
+    std::copy(outPayload.begin(), outPayload.end(),
+              static_cast<uint8_t*>(response));
+    *dataLen = outPayload.size();
+
+    return IPMI_CC_OK;
+}
+
+ipmi_ret_t setSOLConfParams(ipmi_netfn_t netfn, ipmi_cmd_t cmd,
+                            ipmi_request_t request, ipmi_response_t response,
+                            ipmi_data_len_t dataLen, ipmi_context_t context)
+{
+    auto reqData = reinterpret_cast<const SetSOLConfParamsRequest*>(request);
+
+    // Check request length first
+    switch (static_cast<sol::Parameter>(reqData->paramSelector))
+    {
+        case sol::Parameter::progress:
+        case sol::Parameter::enable:
+        case sol::Parameter::authentication:
+        {
+            if (*dataLen != sizeof(SetSOLConfParamsRequest) - 1)
+            {
+                *dataLen = 0;
+                return IPMI_CC_REQ_DATA_LEN_INVALID;
+            }
+            break;
+        }
+        case sol::Parameter::accumulate:
+        case sol::Parameter::retry:
+        {
+            if (*dataLen != sizeof(SetSOLConfParamsRequest))
+            {
+                *dataLen = 0;
+                return IPMI_CC_REQ_DATA_LEN_INVALID;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+
+    *dataLen = 0;
+
+    switch (static_cast<sol::Parameter>(reqData->paramSelector))
+    {
+        case sol::Parameter::progress:
+        {
+            uint8_t progress = reqData->value & progressMask;
+            ipmi::Value currentProgress = 0;
+            if (getSOLParameter("Progress", currentProgress) < 0)
+            {
+                return IPMI_CC_UNSPECIFIED_ERROR;
+            }
+
+            if ((std::get<uint8_t>(currentProgress) == 1) && (progress == 1))
+            {
+                return IPMI_CC_SET_IN_PROGRESS_ACTIVE;
+            }
+
+            if (setSOLParameter("Progress", progress) < 0)
+            {
+                return IPMI_CC_UNSPECIFIED_ERROR;
+            }
+            break;
+        }
+        case sol::Parameter::enable:
+        {
+            bool enable = reqData->value & enableMask;
+            if (setSOLParameter("Enable", enable) < 0)
+            {
+                return IPMI_CC_UNSPECIFIED_ERROR;
+            }
+            break;
+        }
+        case sol::Parameter::authentication:
+        {
+            // if encryption is used authentication must also be used.
+            if (reqData->auth.encrypt && !reqData->auth.auth)
+            {
+                return IPMI_CC_SYSTEM_INFO_PARAMETER_SET_READ_ONLY;
+            }
+            else if (reqData->auth.privilege <
+                         static_cast<uint8_t>(sol::Privilege::userPriv) ||
+                     reqData->auth.privilege >
+                         static_cast<uint8_t>(sol::Privilege::oemPriv))
+            {
+                return IPMI_CC_INVALID_FIELD_REQUEST;
+            }
+
+            if ((setSOLParameter("Privilege", reqData->auth.privilege) < 0) ||
+                (setSOLParameter("ForceEncryption",
+                                 static_cast<bool>(reqData->auth.encrypt)) <
+                 0) ||
+                (setSOLParameter("ForceAuthentication",
+                                 static_cast<bool>(reqData->auth.auth)) < 0))
+            {
+                return IPMI_CC_UNSPECIFIED_ERROR;
+            }
+
+            break;
+        }
+        case sol::Parameter::accumulate:
+        {
+            if (reqData->acc.threshold == 0)
+            {
+                return IPMI_CC_INVALID_FIELD_REQUEST;
+            }
+            if (setSOLParameter("AccumulateIntervalMS", reqData->acc.interval) <
+                0)
+            {
+                return IPMI_CC_UNSPECIFIED_ERROR;
+            }
+            if (setSOLParameter("Threshold", reqData->acc.threshold) < 0)
+            {
+                return IPMI_CC_UNSPECIFIED_ERROR;
+            }
+            break;
+        }
+        case sol::Parameter::retry:
+        {
+            if ((setSOLParameter("RetryCount", reqData->retry.count) < 0) ||
+                (setSOLParameter("RetryIntervalMS", reqData->retry.interval) <
+                 0))
+            {
+                return IPMI_CC_UNSPECIFIED_ERROR;
+            }
+
+            break;
+        }
+        case sol::Parameter::port:
+        {
+            return IPMI_CC_SYSTEM_INFO_PARAMETER_SET_READ_ONLY;
+        }
+        case sol::Parameter::nvbitrate:
+        case sol::Parameter::vbitrate:
+        case sol::Parameter::channel:
+        default:
+            return IPMI_CC_PARM_NOT_SUPPORTED;
+    }
+
+    return IPMI_CC_OK;
+}
+
 void register_netfn_transport_functions()
 {
     // As this timer is only for transport handler
@@ -993,6 +1987,15 @@ void register_netfn_transport_functions()
     // <Get LAN Configuration Parameters>
     ipmi_register_callback(NETFUN_TRANSPORT, IPMI_CMD_GET_LAN, NULL,
                            ipmi_transport_get_lan, PRIVILEGE_OPERATOR);
+
+    ipmi_register_callback(NETFUN_TRANSPORT, IPMI_CMD_SET_SOL_CONF_PARAMS, NULL,
+                           setSOLConfParams, PRIVILEGE_ADMIN);
+
+    ipmi_register_callback(NETFUN_TRANSPORT, IPMI_CMD_GET_SOL_CONF_PARAMS, NULL,
+                           getSOLConfParams, PRIVILEGE_ADMIN);
+
+    // Initialize dbus property progress to 0 every time sol manager restart.
+    initializeSOLInProgress();
 
     return;
 }
